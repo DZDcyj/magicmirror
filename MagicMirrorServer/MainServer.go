@@ -2,12 +2,17 @@ package main
 
 import (
 	. "./Data"
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"github.com/astaxie/beego/orm"
+	"html/template"
+	"io"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
+	"time"
 )
 import _ "github.com/go-sql-driver/mysql"
 
@@ -19,6 +24,7 @@ const DatabaseAddress = "localhost"
 const DatabasePort = "3306"
 const DatabaseName = "magicmirror"
 
+const ServerAddress = "localhost"
 const Port = "50000"
 
 const SUCCESS = 1
@@ -37,12 +43,6 @@ func init() {
 type Response struct {
 	Status int
 	Info   string
-}
-
-type Picture struct {
-	Id       int
-	Path     string
-	ParentId string
 }
 
 // 根据提供的账号/昵称（至多一项）返回对应的用户列表
@@ -346,7 +346,99 @@ func getCommentsByPostId(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprint(w, string(res))
 }
 
+func uploadHandle(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "GET" {
+		// 通过浏览器时，直接返回对应的页面
+		_ = r.ParseForm()
+		if r.Form.Get("parentId") == "" {
+			_, _ = fmt.Fprint(w, "Need parentId")
+			return
+		}
+		curTime := time.Now().Unix()
+		h := md5.New()
+		_, _ = io.WriteString(h, strconv.FormatInt(curTime, 10))
+		token := fmt.Sprintf("%x", h.Sum(nil))
+		t, _ := template.ParseFiles("upload.gtpl")
+		_ = t.Execute(w, token)
+	} else {
+		// 处理上传逻辑
+		_ = r.ParseMultipartForm(32 << 20)
+
+		parentId := r.Form.Get("parentId")
+		if parentId == "" {
+			fmt.Println("No parentId")
+			resp := Response{
+				Status: FAILURE,
+				Info:   "Parent id empty",
+			}
+			sendResponse(w, resp)
+			return
+		}
+		id, _ := strconv.Atoi(parentId)
+		file, handler, err := r.FormFile("uploadfile")
+		if err != nil {
+			fmt.Println(err)
+			resp := Response{
+				Status: FAILURE,
+				Info:   "Failed with form file",
+			}
+			sendResponse(w, resp)
+			return
+		}
+		defer file.Close()
+		_, err = os.Lstat("./uploaded/" + handler.Filename)
+		if !os.IsNotExist(err) {
+			fmt.Println("File already exists")
+			resp := Response{
+				Status: FAILURE,
+				Info:   "File already exists",
+			}
+			sendResponse(w, resp)
+			return
+		}
+		_, _ = fmt.Fprintf(w, "%v", handler.Header)
+		f, err := os.OpenFile("./uploaded/"+handler.Filename, os.O_WRONLY|os.O_CREATE, 0666)
+		// 务必保证目录下 uploaded 存在
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		defer f.Close()
+		pic := Picture{
+			Id:       time.Now().Nanosecond(),
+			Url:      "http://" + ServerAddress + ":" + Port + "/files/" + handler.Filename,
+			ParentId: id,
+		}
+		AddPicture(&pic)
+		_, _ = io.Copy(f, file)
+		resp := Response{
+			Status: SUCCESS,
+			Info:   "Uploaded successfully",
+		}
+		sendResponse(w, resp)
+	}
+}
+
+func getPicturesById(w http.ResponseWriter, r *http.Request) {
+	_ = r.ParseForm()
+	strId := r.Form.Get("parentid")
+	if strId == "" {
+		resp := Response{
+			Status: FAILURE,
+			Info:   "Parent id empty",
+		}
+		sendResponse(w, resp)
+		return
+	}
+	parentId, _ := strconv.Atoi(strId)
+	var pictures []*Picture
+	GetPicturesById(parentId, &pictures)
+	res, _ := json.Marshal(pictures)
+	_, _ = fmt.Fprint(w, string(res))
+}
+
 func main() {
+	fs := http.FileServer(http.Dir("./uploaded"))
 	fmt.Println("Starting server...")
 	http.HandleFunc("/getAllPosts", getAllPost)
 	http.HandleFunc("/getUserMessage", getUserMessage)
@@ -363,7 +455,10 @@ func main() {
 	http.HandleFunc("/getPost", getPostById)
 	http.HandleFunc("/publishPost", publishPost)
 	http.HandleFunc("/commitComment", commitComment)
+	http.HandleFunc("/upload", uploadHandle)
+	http.HandleFunc("/getPictures", getPicturesById)
 
+	http.Handle("/files/", http.StripPrefix("/files", fs))
 	err := http.ListenAndServe(":"+Port, nil)
 	if err != nil {
 		log.Fatal("ListenAndServe: ", err)
